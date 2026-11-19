@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
-"""墨斗管理后台 (Modou Admin Console)
+"""墨斗管理后台 (Modou Admin Console) —— Claude Code + Codex
 
-零依赖的本地 Web 后台，两大功能：
-  1. 消耗检查 —— 解析 ~/.claude/projects/**/*.jsonl 的用量记录，
-     按 昨天 / 本周 / 本月 统计各模型 token 消耗、费用与调配（委派）情况。
-  2. 模型设置 —— 主模型（自动选最贵 / 手动）写入 ~/.claude/settings.json，
-     执行官模型（墨斗）写入 executor.md 的 frontmatter。
+零依赖的本地 Web 后台（Python 3 标准库，单进程）：
+  1. 消耗检查 —— 解析本机用量记录，按 昨天 / 本周 / 本月 统计 token、费用与调配（委派）：
+       · Claude Code：$CLAUDE_CONFIG_DIR（默认 ~/.claude）/projects/**/*.jsonl
+       · Codex：$CODEX_HOME（默认 ~/.codex）/sessions/**/rollout-*.jsonl[.zst]
+     墨斗按「子代理身份」精确识别（Claude：subagent_type；Codex：agent_role），
+     不靠模型名猜。
+  2. 模型设置 —— 只按「系列」设置，不钉死版本：
+       · Claude 主线：settings.json 的 model 写系列别名（fable/opus/sonnet）
+       · Claude 执行官：executor.md 的 model 写系列别名（opus/sonnet/haiku）
+       · Codex 执行官：modou.toml 按系列解析为本机最新 id 后写入
+       · Codex 主线：只读展示 config.toml 的 model（不改用户 Codex 配置）
+     任何写入前先备份到 ~/.local/state/modou/backups/<时间戳>/。
 
-用法:  python3 modou_admin.py [--port 8848] [--claude-dir ~/.claude]
-仅监听 127.0.0.1，不向外发送任何数据，不涉及任何密钥。
+用法:  python3 admin/modou_admin.py [--port 8848] [--project DIR]
+仅监听 127.0.0.1，不向外发送任何数据，不读写任何密钥（不碰 auth.json）。
 """
 
 import argparse
 import json
 import os
 import re
+import shutil
+import sqlite3  # noqa: F401  (保留：将来可读 Codex state 库做交叉校验)
+import subprocess
 import sys
 import webbrowser
 from datetime import datetime, timedelta
@@ -22,75 +32,40 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-# ---------------------------------------------------------------------------
-# 价格表（美元 / 百万 token），缓存写默认按 1.25x 输入价，缓存读按 0.1x。
-# 若 usage 里带 ephemeral_1h_input_tokens 明细，则 1h 缓存写按 2x 计。
-# 数据截至 2026-10（官方价格表 2026-10-06 版）。新一代模型缓存读不再是 0.1x，
-# 用 "cr" 字段写绝对价；没写 "cr" 的模型仍按 0.1x 输入价。
-# ---------------------------------------------------------------------------
-PRICES = {
-    "claude-fable-5-1":  {"in": 10.0, "out": 50.0, "cr": 0.25, "name": "Fable 5.1"},
-    "claude-mythos-5-1": {"in": 10.0, "out": 50.0, "cr": 0.25, "name": "Mythos 5.1"},
-    "claude-fable-5":    {"in": 10.0, "out": 50.0, "name": "Fable 5"},
-    "claude-mythos-5":   {"in": 10.0, "out": 50.0, "name": "Mythos 5"},
-    "claude-opus-5-5":   {"in": 4.0,  "out": 20.0, "cr": 0.20, "name": "Opus 5.5"},
-    "claude-opus-5":     {"in": 5.0,  "out": 25.0, "name": "Opus 5"},
-    "claude-opus-4-8":   {"in": 5.0,  "out": 25.0, "name": "Opus 4.8"},
-    "claude-opus-4-7":   {"in": 5.0,  "out": 25.0, "name": "Opus 4.7"},
-    "claude-opus-4-6":   {"in": 5.0,  "out": 25.0, "name": "Opus 4.6"},
-    "claude-sonnet-5-5": {"in": 2.0,  "out": 10.0, "cr": 0.20, "name": "Sonnet 5.5"},
-    "claude-sonnet-5":   {"in": 2.0,  "out": 10.0, "name": "Sonnet 5"},
-    "claude-sonnet-4-6": {"in": 3.0,  "out": 15.0, "name": "Sonnet 4.6"},
-    "claude-haiku-5-5":  {"in": 0.10, "out": 0.50, "name": "Haiku 5.5"},
-    "claude-haiku-4-5":  {"in": 1.0,  "out": 5.0,  "name": "Haiku 4.5"},
-}
+REPO_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_DIR / "core"))
+import modou_models as mm  # noqa: E402
+import modou_install as mi  # noqa: E402
+
 CACHE_WRITE_5M = 1.25
 CACHE_WRITE_1H = 2.0
 CACHE_READ = 0.1
 
-# 可在下拉框中选择的执行官候选模型
-EXECUTOR_CHOICES = [
-    "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8",
-    "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-5-5",
-]
-MAIN_CHOICES = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"]
-
-# 执行官速度档位（frontmatter 的 effort 字段）。子代理不支持 /fast 极速模式，
-# effort 是官方支持的提速手段：档位越低思考越少 → 越快、越省 token。
+# 执行官速度档位。Claude：frontmatter 的 effort；Codex：model_reasoning_effort。
 EFFORT_CHOICES = ["low", "medium", "high", "xhigh", "max"]
 
 
-def norm_model(model_id):
-    """把带日期后缀的 id (claude-haiku-4-5-20251001) 归一到价格表键。"""
-    if not model_id:
-        return None
-    for key in sorted(PRICES, key=len, reverse=True):
-        if model_id == key or model_id.startswith(key + "-"):
-            return key
-    return model_id
-
-
-def price_of(model_id):
-    return PRICES.get(norm_model(model_id))
-
-
-def most_expensive_model():
-    """自动模式：主模型 = 价格表里最贵的（按输入价，其次输出价）。
-    Mythos 仅对特定组织开放，自动模式跳过它。同价时取表中靠前的（新版在前）。"""
-    candidates = {k: v for k, v in PRICES.items() if "mythos" not in k}
-    return max(candidates, key=lambda k: (candidates[k]["in"], candidates[k]["out"]))
+def model_name(model_id):
+    p = mm.price_of(model_id)
+    return p["name"] if p else (model_id or "?")
 
 
 def cost_usd(model_id, usage):
-    """按单条 usage 计费；未知模型返回 None。"""
-    p = price_of(model_id)
+    """按单条（已归一的）usage 计费；未知模型 / Mythos 返回 None。
+
+    归一后的 usage 键：input_tokens（未命中缓存的输入）、output_tokens、
+    cache_creation_input_tokens、cache_read_input_tokens、cache_creation（Claude 明细，可选）。"""
+    p = mm.price_of(model_id)
     if not p:
         return None
     inp = usage.get("input_tokens", 0) or 0
     out = usage.get("output_tokens", 0) or 0
     cw = usage.get("cache_creation_input_tokens", 0) or 0
     cr = usage.get("cache_read_input_tokens", 0) or 0
-    # 有 5m/1h 明细时按明细计缓存写费用
+    if mm.platform_of(model_id) == "codex":
+        return (inp * p["in"] + out * p["out"] + cw * p.get("cw", p["in"])
+                + cr * p.get("cr", CACHE_READ * p["in"])) / 1e6
+    # Claude：有 5m/1h 明细时按明细计缓存写费用
     detail = usage.get("cache_creation") or {}
     w5 = detail.get("ephemeral_5m_input_tokens")
     w1 = detail.get("ephemeral_1h_input_tokens")
@@ -117,7 +92,9 @@ AGENT_TOOLS = ("Task", "Agent")
 AGENT_FILE_RE = re.compile(r"^agent-([^.]+)$")
 
 
-class UsageScanner:
+class ClaudeScanner:
+    platform = "claude"
+
     def __init__(self, claude_dir):
         self.projects_dir = Path(claude_dir) / "projects"
         self._file_cache = {}  # path -> (mtime, size, parsed)
@@ -210,7 +187,8 @@ class UsageScanner:
                     recs.append({
                         "key": key,
                         "dt": dt,
-                        "model": norm_model(model),
+                        "platform": "claude",
+                        "model": mm.norm_model(model),
                         "raw_model": model,
                         "sidechain": sidechain,
                         "agent_id": (obj.get("agentId") or file_agent_id) if sidechain else None,
@@ -290,7 +268,7 @@ def aggregate(records, start, end, main_model, executor_model, executor_name="ex
             continue
         u, m = r["usage"], r["model"]
         c = cost_usd(m, u) or 0.0
-        slot = by_model.setdefault(m, {"model": m, "name": PRICES.get(m, {}).get("name", m),
+        slot = by_model.setdefault(m, {"model": m, "name": model_name(m),
                                        "input": 0, "output": 0, "cache_write": 0,
                                        "cache_read": 0, "cost": 0.0, "requests": 0,
                                        "cost_main": 0.0, "cost_modou": 0.0, "cost_other": 0.0})
@@ -335,9 +313,9 @@ def aggregate(records, start, end, main_model, executor_model, executor_name="ex
 
     # 省钱基准：该时段主线实际用得最多的模型（按输出 token），没有则用设置里的主模型
     baseline = max(main_out_by_model, key=main_out_by_model.get) if main_out_by_model else main_model
-    if baseline not in PRICES:
+    if not mm.price_of(baseline):
         baseline = main_model
-    if PRICES.get(baseline):
+    if mm.price_of(baseline):
         for r in modou_recs:
             exec_stat["cost_if_main"] += cost_usd(baseline, r["usage"]) or 0.0
 
@@ -345,7 +323,7 @@ def aggregate(records, start, end, main_model, executor_model, executor_name="ex
     total_out = totals["output"]
     delegation_ratio = (exec_stat["output"] / total_out) if total_out else 0.0
     for a in other_agents.values():
-        a["models"] = sorted(PRICES.get(x, {}).get("name", x) for x in a["models"])
+        a["models"] = sorted(model_name(x) for x in a["models"])
     return {
         "start": start.isoformat() if start else None,
         "end": end.isoformat(),
@@ -364,19 +342,184 @@ def aggregate(records, start, end, main_model, executor_model, executor_name="ex
 
 
 # ---------------------------------------------------------------------------
-# 模型设置：主模型 -> ~/.claude/settings.json；执行官 -> executor.md frontmatter
+# Codex 用量扫描：$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl（旧会话会被压成
+# .jsonl.zst）。每个线程（主线或子代理）一个文件：
+#   session_meta.payload：id、thread_source（user/subagent）、agent_role（custom agent 名）、
+#                         source.subagent.thread_spawn.parent_thread_id
+#   turn_context.payload.model：本轮模型
+#   token_usage_record.payload：每次响应一条，带 response_id、thread_id、usage
+#     （OpenAI 口径：input_tokens 已含 cached_input_tokens）
+# 老版本没有 token_usage_record 时，退回 event_msg/token_count 的 last_token_usage。
+# 墨斗识别：子代理线程的 agent_role == modou.toml 的 name（默认 modou）。
 # ---------------------------------------------------------------------------
-class Config:
-    def __init__(self, claude_dir, repo_dir):
+def _zstd_lines(path):
+    try:
+        from compression import zstd  # Python 3.14+
+        with zstd.open(path, "rt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                yield line
+        return
+    except ImportError:
+        pass
+    exe = shutil.which("zstd")
+    if not exe:
+        raise OSError("no zstd decoder")
+    out = subprocess.run([exe, "-dc", str(path)], capture_output=True, timeout=60)
+    if out.returncode != 0:
+        raise OSError("zstd failed")
+    for line in out.stdout.decode("utf-8", "replace").splitlines():
+        yield line
+
+
+def _norm_codex_usage(u):
+    inp = u.get("input_tokens", 0) or 0
+    cached = u.get("cached_input_tokens", 0) or 0
+    cw = u.get("cache_write_input_tokens", 0) or 0
+    return {
+        "input_tokens": max(0, inp - cached - cw),
+        "output_tokens": u.get("output_tokens", 0) or 0,
+        "cache_creation_input_tokens": cw,
+        "cache_read_input_tokens": cached,
+        "cache_creation": None,
+    }
+
+
+class CodexScanner:
+    platform = "codex"
+    MARKERS = ('"session_meta"', '"turn_context"', '"token_usage_record"', '"token_count"')
+
+    def __init__(self, codex_dir):
+        self.codex_dir = Path(codex_dir)
+        self.projects_dir = self.codex_dir / "sessions"
+        self.dirs = [self.codex_dir / "sessions", self.codex_dir / "archived_sessions"]
+        self._file_cache = {}
+        self.unreadable = 0
+
+    def files(self):
+        for d in self.dirs:
+            if not d.is_dir():
+                continue
+            for p in d.rglob("rollout-*"):
+                if p.name.endswith(".jsonl") or p.name.endswith(".jsonl.zst"):
+                    yield p
+
+    def records(self):
+        out, unreadable = [], 0
+        for path in self.files():
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            cached = self._file_cache.get(str(path))
+            if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+                parsed = cached[2]
+            else:
+                parsed = self._parse_file(path)
+                self._file_cache[str(path)] = (st.st_mtime, st.st_size, parsed)
+            if parsed is None:
+                unreadable += 1
+                continue
+            out.extend(parsed)
+        self.unreadable = unreadable
+        seen, dedup = set(), []
+        for r in out:
+            if r["key"] in seen:
+                continue
+            seen.add(r["key"])
+            dedup.append(r)
+        return dedup
+
+    def _parse_file(self, path):
+        try:
+            lines = _zstd_lines(path) if path.name.endswith(".zst") else \
+                open(path, encoding="utf-8", errors="replace")
+            recs, fallback = [], []
+            meta, model, last_total = None, None, None
+            for line in lines:
+                if not any(m in line for m in self.MARKERS):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                t, p = obj.get("type"), obj.get("payload") or {}
+                if t == "session_meta" and meta is None:
+                    src = p.get("source")
+                    spawn = (src.get("subagent") or {}).get("thread_spawn") or {} \
+                        if isinstance(src, dict) else {}
+                    sub = p.get("thread_source") == "subagent" or \
+                        (isinstance(src, dict) and "subagent" in src)
+                    meta = {"id": p.get("id"), "sidechain": bool(sub),
+                            "role": p.get("agent_role") or spawn.get("agent_role"),
+                            "parent": spawn.get("parent_thread_id")}
+                elif t == "turn_context":
+                    model = p.get("model") or model
+                elif t == "token_usage_record":
+                    if meta and p.get("thread_id") and meta["id"] and p["thread_id"] != meta["id"]:
+                        continue  # fork 回放的别的线程记录
+                    r = self._rec(obj, p.get("usage"), model, meta,
+                                  p.get("response_id") or (obj.get("timestamp"), obj.get("ordinal")))
+                    if r:
+                        recs.append(r)
+                elif t == "event_msg" and p.get("type") == "token_count":
+                    info = p.get("info") or {}
+                    tot = info.get("total_token_usage")
+                    if info.get("last_token_usage") and tot != last_total:
+                        r = self._rec(obj, info["last_token_usage"], model, meta,
+                                      ("tc", meta and meta["id"], obj.get("timestamp")))
+                        if r:
+                            fallback.append(r)
+                        last_total = tot
+            if hasattr(lines, "close"):
+                lines.close()
+            return recs or fallback
+        except OSError:
+            return None
+
+    @staticmethod
+    def _rec(obj, usage, model, meta, key):
+        ts = obj.get("timestamp")
+        if not usage or not ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        except ValueError:
+            return None
+        meta = meta or {"id": None, "sidechain": False, "role": None, "parent": None}
+        return {
+            "key": key,
+            "dt": dt,
+            "platform": "codex",
+            "model": (model or "unknown").lower(),
+            "raw_model": model,
+            "sidechain": meta["sidechain"],
+            "agent_id": meta["id"] if meta["sidechain"] else None,
+            "agent_type": (meta["role"] or "default（fork）") if meta["sidechain"] else None,
+            "usage": _norm_codex_usage(usage),
+        }
+
+
+# ---------------------------------------------------------------------------
+# 模型设置（只按系列）
+# ---------------------------------------------------------------------------
+def _first_file(paths):
+    for p in paths:
+        if p and p.is_file():
+            return p
+    return None
+
+
+class ClaudeConfig:
+    platform = "claude"
+
+    def __init__(self, claude_dir, project=None):
         self.claude_dir = Path(claude_dir)
         self.settings_path = self.claude_dir / "settings.json"
-        # 优先全局安装的 executor，其次仓库内的
-        self.executor_paths = [
-            self.claude_dir / "agents" / "executor.md",
-            repo_dir / "agents" / "executor.md",
-        ]
+        self.executor_paths = ([Path(project) / ".claude" / "agents" / "executor.md"] if project else []) + \
+            [self.claude_dir / "agents" / "executor.md"]
 
-    # -- 主模型 --------------------------------------------------------------
     def read_settings(self):
         try:
             return json.loads(self.settings_path.read_text(encoding="utf-8"))
@@ -386,79 +529,192 @@ class Config:
     def get_main_model(self):
         return self.read_settings().get("model")
 
-    def set_main_model(self, model):
+    def set_main_family(self, family):
+        if family not in mm.POLICY["claude"]["main_pref"]:
+            raise ValueError("不支持的主线系列：%s" % family)
         settings = self.read_settings()
-        settings["model"] = model
-        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
-        self.settings_path.write_text(
-            json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        settings["model"] = family
+        w = mi.Writer()
+        w.write(self.settings_path, json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
+        return w.log
 
-    # -- 执行官模型 ----------------------------------------------------------
     def executor_file(self):
-        for p in self.executor_paths:
-            if p.is_file():
-                return p
-        return None
+        return _first_file(self.executor_paths)
 
-    def get_executor_model(self):
-        p = self.executor_file()
-        if not p:
-            return None, None
-        m = re.search(r"^model:\s*(\S+)\s*$", p.read_text(encoding="utf-8"), re.M)
-        return (m.group(1) if m else None), str(p)
-
-    def set_executor_model(self, model):
-        p = self.executor_file()
-        if not p:
-            raise FileNotFoundError("找不到 executor.md（未安装墨斗？）")
-        text = p.read_text(encoding="utf-8")
-        new_text, n = re.subn(r"^model:\s*\S+\s*$", f"model: {model}", text, count=1, flags=re.M)
-        if n == 0:
-            raise ValueError("executor.md frontmatter 里没有 model: 字段")
-        p.write_text(new_text, encoding="utf-8")
-        return str(p)
-
-    def get_executor_name(self):
-        """frontmatter 的 name 字段，即主线调用时的 subagent_type。"""
-        p = self.executor_file()
-        if p:
-            m = re.search(r"^name:\s*(\S+)\s*$", p.read_text(encoding="utf-8"), re.M)
-            if m:
-                return m.group(1)
-        return "executor"
-
-    # -- 执行官速度（effort）--------------------------------------------------
-    def get_executor_effort(self):
+    def _get(self, key):
         p = self.executor_file()
         if not p:
             return None
-        m = re.search(r"^effort:\s*(\S+)\s*$", p.read_text(encoding="utf-8"), re.M)
+        m = re.search(r"^%s:\s*(\S+)\s*$" % key, p.read_text(encoding="utf-8"), re.M)
         return m.group(1) if m else None
 
-    def set_executor_effort(self, effort):
-        """effort 为 EFFORT_CHOICES 之一；传 "" 表示删除该字段（跟随会话默认）。"""
+    def get_executor_model(self):
+        p = self.executor_file()
+        return self._get("model"), (str(p) if p else None)
+
+    def get_executor_name(self):
+        return self._get("name") or "executor"
+
+    def get_executor_effort(self):
+        return self._get("effort")
+
+    def set_executor(self, family, effort):
+        """family 为 opus/sonnet/haiku；effort 为档位或 ""（删除 → 跟随会话默认）。"""
+        if family not in mm.POLICY["claude"]["executor_pref"]:
+            raise ValueError("不支持的执行官系列：%s" % family)
         p = self.executor_file()
         if not p:
-            raise FileNotFoundError("找不到 executor.md（未安装墨斗？）")
+            raise FileNotFoundError("找不到已安装的 executor.md（先运行 bash install.sh --claude）")
         text = p.read_text(encoding="utf-8")
+        text, n = re.subn(r"^model:\s*\S+\s*$", "model: %s" % family, text, count=1, flags=re.M)
+        if n == 0:
+            raise ValueError("executor.md frontmatter 里没有 model: 字段")
+        text = re.sub(r"（执行官系列：[a-z]+）", "（执行官系列：%s）" % family, text, count=1)
         if effort:
-            new_text, n = re.subn(r"^effort:\s*\S+\s*$", f"effort: {effort}",
-                                  text, count=1, flags=re.M)
-            if n == 0:  # 没有 effort 行，插到 model 行后面
-                new_text, n = re.subn(r"^(model:\s*\S+\s*)$", rf"\1\neffort: {effort}",
-                                      text, count=1, flags=re.M)
-                if n == 0:
-                    raise ValueError("executor.md frontmatter 里没有 model: 字段")
+            text, n = re.subn(r"^effort:\s*\S+\s*$", "effort: %s" % effort, text, count=1, flags=re.M)
+            if n == 0:
+                text = re.sub(r"^(model:\s*\S+\s*)$", r"\1\neffort: %s" % effort, text, count=1, flags=re.M)
         else:
-            new_text = re.sub(r"^effort:\s*\S+\s*\n?", "", text, count=1, flags=re.M)
-        p.write_text(new_text, encoding="utf-8")
-        return str(p)
+            text = re.sub(r"^effort:\s*\S+\s*\n?", "", text, count=1, flags=re.M)
+        w = mi.Writer()
+        w.write(p, text)
+        return str(p), w.log
+
+
+class CodexConfig:
+    platform = "codex"
+
+    def __init__(self, codex_dir, project=None):
+        self.codex_dir = Path(codex_dir)
+        self.config_path = self.codex_dir / "config.toml"
+        self.project = project
+        self.executor_paths = ([Path(project) / ".codex" / "agents" / "modou.toml"] if project else []) + \
+            [self.codex_dir / "agents" / "modou.toml"]
+
+    def get_main_model(self):
+        if self.project:
+            m = mi.main_model_for("codex", "project", self.project)
+            if m:
+                return m
+        return mm.codex_config_model()
+
+    def executor_file(self):
+        return _first_file(self.executor_paths)
+
+    def _get(self, key):
+        p = self.executor_file()
+        if not p:
+            return None
+        m = re.search(r'^%s\s*=\s*"([^"]*)"' % key, p.read_text(encoding="utf-8"), re.M)
+        return m.group(1) if m else None
+
+    def get_executor_model(self):
+        p = self.executor_file()
+        return self._get("model"), (str(p) if p else None)
+
+    def get_executor_name(self):
+        return self._get("name") or "modou"
+
+    def get_executor_effort(self):
+        return self._get("model_reasoning_effort")
+
+    def set_executor(self, family, effort):
+        if family not in mm.POLICY["codex"]["executor_pref"]:
+            raise ValueError("不支持的执行官系列：%s" % family)
+        p = self.executor_file()
+        if not p:
+            raise FileNotFoundError("找不到已安装的 modou.toml（先运行 bash install.sh --codex）")
+        res = mm.resolve_codex(family)
+        if not res:
+            raise ValueError("本机 Codex 模型目录里没有 %s 系列" % family)
+        effort = effort or mm.POLICY["codex"]["executor_effort"].get(family)
+        w = mi.Writer()
+        w.write(p, mi.render_codex(res["slug"], effort, family))
+        return str(p), res["slug"], w.log
+
+
+def family_prices(platform):
+    out = {}
+    for fam in mm.FAMILIES[platform]:
+        p = mm.family_price(platform, fam)
+        if p:
+            out[fam] = {"in": p["in"], "out": p["out"], "ref": mm.latest_known(platform, fam),
+                        "label": mm.FAMILIES[platform][fam]["label"]}
+    return out
+
 
 
 # ---------------------------------------------------------------------------
 # HTTP 服务
 # ---------------------------------------------------------------------------
-def make_handler(scanner, config):
+def settings_payload(ctx):
+    cc, xc = ctx["claude_cfg"], ctx["codex_cfg"]
+    c_exec, c_path = cc.get_executor_model()
+    c_main = cc.get_main_model()
+    x_exec, x_path = xc.get_executor_model()
+    x_main = xc.get_main_model()
+    avail = ctx["codex_models"]()
+    x_res = {f: (mm.resolve_codex(f, avail) or {}).get("slug") for f in mm.FAMILIES["codex"]}
+    x_family = mm.family_of(x_exec) if x_exec else None
+    x_latest = x_res.get(x_family) if x_family else None
+    prices = {k: dict(v, platform=mm.platform_of(k)) for k, v in mm.PRICES.items()}
+    return {
+        "prices": prices,
+        "effort_choices": EFFORT_CHOICES,
+        "claude": {
+            "main_model": c_main,
+            "main_family": mm.family_of(c_main) if c_main else None,
+            "main_choices": mm.POLICY["claude"]["main_pref"],
+            "main_auto": mm.POLICY["claude"]["main_pref"][0],
+            "executor_model": c_exec,
+            "executor_family": mm.family_of(c_exec) if c_exec else None,
+            "executor_path": c_path,
+            "executor_effort": cc.get_executor_effort(),
+            "executor_choices": mm.POLICY["claude"]["executor_pref"],
+            "family_prices": family_prices("claude"),
+            "settings_path": str(cc.settings_path),
+            "usage_dir": str(ctx["scanners"]["claude"].projects_dir),
+            "usage_found": ctx["scanners"]["claude"].projects_dir.is_dir(),
+        },
+        "codex": {
+            "main_model": x_main,
+            "main_family": mm.family_of(x_main) if x_main else None,
+            "executor_model": x_exec,
+            "executor_family": x_family,
+            "executor_latest": x_latest,
+            "executor_path": x_path,
+            "executor_effort": xc.get_executor_effort(),
+            "executor_choices": mm.POLICY["codex"]["executor_pref"],
+            "resolved": x_res,
+            "available": [m["slug"] for m in avail],
+            "family_prices": family_prices("codex"),
+            "config_path": str(xc.config_path),
+            "usage_dir": str(ctx["scanners"]["codex"].projects_dir),
+            "usage_found": ctx["scanners"]["codex"].projects_dir.is_dir(),
+            "unreadable_files": ctx["scanners"]["codex"].unreadable,
+        },
+    }
+
+
+def usage_payload(ctx, platform, rng):
+    start, end = range_bounds(rng)
+    cfg = ctx["claude_cfg"] if platform == "claude" else ctx["codex_cfg"]
+    exec_model, _ = cfg.get_executor_model()
+    main = cfg.get_main_model()
+    main_family = mm.family_of(main) if main else mm.POLICY[platform]["main_pref"][0]
+    if not main or not mm.selectable(main_family):
+        main_family = mm.POLICY[platform]["main_pref"][0]
+    main_model = mm.norm_model(main) if main and mm.parse(main)[2] else mm.latest_known(platform, main_family)
+    exec_norm = mm.norm_model(exec_model) if exec_model and mm.parse(exec_model)[2] else None
+    data = aggregate(ctx["scanners"][platform].records(), start, end,
+                     main_model, exec_norm, cfg.get_executor_name())
+    data["range"] = rng
+    data["platform"] = platform
+    data["baseline_name"] = model_name(data["baseline_model"]) if data["baseline_model"] else None
+    return data
+
+
+def make_handler(ctx):
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # 安静一点
@@ -469,11 +725,13 @@ def make_handler(scanner, config):
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self):
             url = urlparse(self.path)
+            q = parse_qs(url.query)
             if url.path == "/":
                 body = PAGE.encode("utf-8")
                 self.send_response(200)
@@ -481,70 +739,69 @@ def make_handler(scanner, config):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-            elif url.path == "/api/usage":
-                q = parse_qs(url.query)
-                rng = (q.get("range") or ["yesterday"])[0]
-                start, end = range_bounds(rng)
-                exec_model, _ = config.get_executor_model()
-                main_model = norm_model(config.get_main_model()) or most_expensive_model()
-                data = aggregate(scanner.records(), start, end,
-                                 main_model, norm_model(exec_model),
-                                 config.get_executor_name())
-                data["range"] = rng
-                self._json(data)
-            elif url.path == "/api/settings":
-                exec_model, exec_path = config.get_executor_model()
+            elif url.path == "/api/health":
+                s = settings_payload(ctx)
                 self._json({
-                    "main_model": config.get_main_model(),
-                    "main_auto_pick": most_expensive_model(),
-                    "main_choices": MAIN_CHOICES,
-                    "executor_model": exec_model,
-                    "executor_path": exec_path,
-                    "executor_choices": EXECUTOR_CHOICES,
-                    "executor_effort": config.get_executor_effort(),
-                    "effort_choices": EFFORT_CHOICES,
-                    "prices": PRICES,
-                    "settings_path": str(config.settings_path),
-                    "projects_dir": str(scanner.projects_dir),
-                    "projects_found": scanner.projects_dir.is_dir(),
+                    "ok": True,
+                    "bind": "127.0.0.1",
+                    "claude": {"executor_installed": bool(s["claude"]["executor_path"]),
+                               "executor_model": s["claude"]["executor_model"],
+                               "usage_dir_found": s["claude"]["usage_found"]},
+                    "codex": {"executor_installed": bool(s["codex"]["executor_path"]),
+                              "executor_model": s["codex"]["executor_model"],
+                              "executor_latest": s["codex"]["executor_latest"],
+                              "usage_dir_found": s["codex"]["usage_found"],
+                              "models_available": len(s["codex"]["available"])},
                 })
+            elif url.path == "/api/usage":
+                plat = (q.get("platform") or ["claude"])[0]
+                if plat not in ("claude", "codex"):
+                    return self._json({"error": "unknown platform"}, 400)
+                self._json(usage_payload(ctx, plat, (q.get("range") or ["yesterday"])[0]))
+            elif url.path == "/api/settings":
+                self._json(settings_payload(ctx))
             else:
                 self._json({"error": "not found"}, 404)
 
+        def _same_origin(self):
+            """只接受本页发起的 JSON POST：防止别的网页跨站改本机配置。"""
+            if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                return False
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return True  # curl 等本地工具
+            port = self.server.server_address[1]
+            return origin in ("http://127.0.0.1:%d" % port, "http://localhost:%d" % port)
+
         def do_POST(self):
             url = urlparse(self.path)
+            if not self._same_origin():
+                return self._json({"error": "forbidden"}, 403)
             length = int(self.headers.get("Content-Length") or 0)
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:
                 return self._json({"error": "bad json"}, 400)
-
-            if url.path == "/api/settings/main":
-                if payload.get("auto"):
-                    model = most_expensive_model()
+            effort = payload.get("effort", "")
+            if effort not in ("", None) and effort not in EFFORT_CHOICES:
+                return self._json({"error": "未知 effort: %s" % effort}, 400)
+            try:
+                if url.path == "/api/settings/claude/main":
+                    fam = mm.POLICY["claude"]["main_pref"][0] if payload.get("auto") else payload.get("family")
+                    log = ctx["claude_cfg"].set_main_family(fam)
+                    self._json({"ok": True, "family": fam, "log": log})
+                elif url.path == "/api/settings/claude/executor":
+                    path, log = ctx["claude_cfg"].set_executor(payload.get("family"), effort or "")
+                    self._json({"ok": True, "family": payload.get("family"), "effort": effort,
+                                "path": path, "log": log, "note": "新开会话后生效"})
+                elif url.path == "/api/settings/codex/executor":
+                    path, slug, log = ctx["codex_cfg"].set_executor(payload.get("family"), effort or "")
+                    self._json({"ok": True, "family": payload.get("family"), "model": slug,
+                                "path": path, "log": log, "note": "新开会话后生效"})
                 else:
-                    model = payload.get("model")
-                    if model not in PRICES:
-                        return self._json({"error": f"未知模型: {model}"}, 400)
-                config.set_main_model(model)
-                self._json({"ok": True, "model": model})
-            elif url.path == "/api/settings/executor":
-                model = payload.get("model")
-                effort = payload.get("effort", None)  # None=不动; ""=删除; 其他需合法
-                if model not in PRICES:
-                    return self._json({"error": f"未知模型: {model}"}, 400)
-                if effort not in (None, "") and effort not in EFFORT_CHOICES:
-                    return self._json({"error": f"未知 effort: {effort}"}, 400)
-                try:
-                    path = config.set_executor_model(model)
-                    if effort is not None:
-                        config.set_executor_effort(effort)
-                except (FileNotFoundError, ValueError) as e:
-                    return self._json({"error": str(e)}, 400)
-                self._json({"ok": True, "model": model, "effort": effort,
-                            "path": path, "note": "新开会话后生效"})
-            else:
-                self._json({"error": "not found"}, 404)
+                    self._json({"error": "not found"}, 404)
+            except (FileNotFoundError, ValueError) as e:
+                self._json({"error": str(e)}, 400)
 
     return Handler
 
@@ -617,8 +874,12 @@ code { background:var(--accent-weak); padding:1px 5px; border-radius:4px; font-s
 <body>
 <div class="wrap">
   <h1>墨斗管理后台 <small>Modou Admin Console</small></h1>
-  <div class="muted">主线弹线，工匠照线施工 —— 消耗检查 · 模型设置</div>
+  <div class="muted">主线弹线，工匠照线施工 —— 消耗检查 · 模型设置 · Claude Code + Codex</div>
 
+  <div class="tabs" id="plats">
+    <button class="tab" data-p="claude">Claude Code</button>
+    <button class="tab" data-p="codex">Codex</button>
+  </div>
   <div class="tabs" id="tabs">
     <button class="tab" data-r="yesterday">昨天</button>
     <button class="tab" data-r="week">本周</button>
@@ -652,23 +913,18 @@ code { background:var(--accent-weak); padding:1px 5px; border-radius:4px; font-s
   </div>
 
   <div class="card">
-    <h2>模型设置</h2>
-    <div class="row">
-      <label>主模型：</label>
-      <label><input type="checkbox" id="autoMain"> 自动选择最贵</label>
-      <select id="mainSelect"></select>
-      <button class="primary" onclick="saveMain()">保存主模型</button>
-    </div>
-    <div class="muted" id="mainInfo"></div>
+    <h2>模型设置 <span class="muted" id="setPlat"></span></h2>
+    <div class="muted">只按<b>系列</b>设置，不钉死版本：Claude 写系列别名（Claude Code 自动用该系列最新版）；
+      Codex 按系列解析成本机 <code>codex debug models</code> 里的最新 id。写入前自动备份。</div>
+    <div id="mainRow"></div>
     <div class="row" style="margin-top:14px">
-      <label>执行官（墨斗）模型：</label>
+      <label>执行官（墨斗）系列：</label>
       <select id="execSelect"></select>
       <label>速度档位：</label>
       <select id="effortSelect"></select>
       <button class="primary" onclick="saveExec()">保存执行官</button>
     </div>
-    <div class="muted">速度档位即 effort：档位越低施工越快、token 越省（思考更少）。
-      子代理不支持 /fast 极速模式，effort 是官方支持的提速手段；机械性实施推荐 low / medium。</div>
+    <div class="muted" id="effortNote"></div>
     <div class="muted" id="execInfo"></div>
     <div class="muted" id="pairWarn" style="margin-top:6px"></div>
   </div>
@@ -682,7 +938,7 @@ code { background:var(--accent-weak); padding:1px 5px; border-radius:4px; font-s
 <div id="toast"></div>
 
 <script>
-let S = null, currentRange = "yesterday";
+let S = null, currentRange = "yesterday", P = "claude";
 const $ = id => document.getElementById(id);
 const fmtT = n => n >= 1e9 ? (n/1e9).toFixed(2)+"B" : n >= 1e6 ? (n/1e6).toFixed(2)+"M"
               : n >= 1e3 ? (n/1e3).toFixed(1)+"K" : String(n);
@@ -698,7 +954,7 @@ function toast(msg, isErr) {
 async function loadUsage(range) {
   currentRange = range;
   document.querySelectorAll(".tab").forEach(b => b.classList.toggle("on", b.dataset.r === range));
-  const d = await (await fetch("/api/usage?range=" + range)).json();
+  const d = await (await fetch(`/api/usage?platform=${P}&range=${range}`)).json();
   $("rangeLabel").textContent = "· " + (rangeNames[range] || range);
   const t = d.totals;
   $("kpis").innerHTML = [
@@ -719,12 +975,12 @@ async function loadUsage(range) {
     kpi(fmtC(d.other.cost), "其他子代理花费"),
     kpi(`${mn.requests} / ${ex.requests} / ${d.other.requests}`, "请求数 主线/墨斗/其他"),
   ].join("");
-  const baseName = (S && S.prices[d.baseline_model] || {}).name || d.baseline_model;
+  const baseName = d.baseline_name || d.baseline_model;
   $("delegationNote").textContent = ex.requests === 0
     ? "该时段没有墨斗（执行官）的调用记录。实施类任务多让主线委派给墨斗，省钱又省上下文。"
     : `若这些实施工作全由主线实际所用的 ${baseName} 完成需 ${fmtC(ex.cost_if_main)}，实际仅 ${fmtC(ex.cost)}。`;
   $("identNote").innerHTML = ex.requests === 0 ? "" :
-    `墨斗识别：<b>${ex.exact}</b> 条按子代理身份（<code>${d.executor_name}</code>）精确识别` +
+    `墨斗识别：<b>${ex.exact}</b> 条按子代理身份（<code>${esc(d.executor_name)}</code>）精确识别` +
     (ex.inferred ? `，<span class="warn">${ex.inferred} 条查不到身份、按执行官模型推断</span>（会话仍在进行或日志较旧）` : "") + "。";
   $("agentTable").innerHTML = d.other_agents.length
     ? "<tr><th>其他子代理（不计入墨斗）</th><th>请求</th><th>输出</th><th>模型</th><th>费用</th></tr>" +
@@ -733,7 +989,7 @@ async function loadUsage(range) {
     : "";
 
   const rows = d.by_model.map(m =>
-    `<tr><td>${m.name}<div class="muted">${m.model}</div></td><td>${m.requests}</td>` +
+    `<tr><td>${esc(m.name)}<div class="muted">${esc(m.model)}</div></td><td>${m.requests}</td>` +
     `<td>${fmtT(m.input)}</td><td>${fmtT(m.output)}</td><td>${fmtT(m.cache_read)}</td>` +
     `<td>${fmtT(m.cache_write)}</td><td><b>${fmtC(m.cost)}</b></td>` +
     `<td class="muted">${split(m)}</td></tr>`).join("");
@@ -766,50 +1022,68 @@ function kpi(v, l, hl) {
   return `<div class="kpi${hl ? " hl" : ""}"><div class="v">${v}</div><div class="l">${l}</div></div>`;
 }
 
+const famLabel = (plat, f) => (S[plat].family_prices[f] || {}).label || f || "—";
+const famPrice = (plat, f) => { const p = S[plat].family_prices[f]; return p ? ` ($${p.in}/$${p.out})` : ""; };
+
 async function loadSettings() {
   S = await (await fetch("/api/settings")).json();
-  const mainSel = $("mainSelect");
-  mainSel.innerHTML = S.main_choices.map(m =>
-    `<option value="${m}">${S.prices[m].name} ($${S.prices[m].in}/$${S.prices[m].out})</option>`).join("");
-  const curMain = S.main_model && Object.keys(S.prices).find(k =>
-    S.main_model === k || S.main_model.startsWith(k + "-"));
-  const auto = !S.main_model || curMain === S.main_auto_pick;
-  $("autoMain").checked = auto;
-  mainSel.value = curMain || S.main_auto_pick;
-  mainSel.disabled = auto;
-  $("mainInfo").innerHTML = S.main_model
-    ? `当前 settings.json 中：<code>${S.main_model}</code>（${S.settings_path}）`
-    : `settings.json 未设置 model，Claude Code 使用其默认模型。自动模式将写入最贵的 <code>${S.main_auto_pick}</code>。`;
+  const C = S[P];
+  $("setPlat").textContent = "· " + (P === "claude" ? "Claude Code" : "Codex");
+  document.querySelectorAll("#plats .tab").forEach(b => b.classList.toggle("on", b.dataset.p === P));
 
-  const execSel = $("execSelect");
-  execSel.innerHTML = S.executor_choices.map(m =>
-    `<option value="${m}">${S.prices[m].name} ($${S.prices[m].in}/$${S.prices[m].out})</option>`).join("");
-  if (S.executor_model && S.prices[S.executor_model]) execSel.value = S.executor_model;
+  if (P === "claude") {
+    $("mainRow").innerHTML = `<div class="row" style="margin-top:10px"><label>主线系列：</label>
+      <label><input type="checkbox" id="autoMain"> 自动（最强可用：${famLabel("claude", C.main_auto)}）</label>
+      <select id="mainSelect">${C.main_choices.map(f =>
+        `<option value="${f}">${famLabel("claude", f)}${famPrice("claude", f)}</option>`).join("")}</select>
+      <button class="primary" onclick="saveMain()">保存主线</button></div>
+      <div class="muted">${C.main_model
+        ? `当前 settings.json：<code>${esc(C.main_model)}</code>（${esc(C.settings_path)}）` +
+          (C.main_family && !C.main_choices.includes(C.main_family) ? ` <span class="warn">（非可选主线系列）</span>` : "") +
+          (/\d/.test(C.main_model) ? ` <span class="warn">钉死了具体版本，建议改成系列别名</span>` : "")
+        : `settings.json 未设置 model，Claude Code 用其默认模型。`}</div>`;
+    const auto = !C.main_model || (C.main_family === C.main_auto && !/\d/.test(C.main_model));
+    $("autoMain").checked = auto;
+    $("mainSelect").value = C.main_choices.includes(C.main_family) ? C.main_family : C.main_auto;
+    $("mainSelect").disabled = auto;
+    $("autoMain").addEventListener("change", e => { $("mainSelect").disabled = e.target.checked; updatePairWarn(); });
+    $("mainSelect").addEventListener("change", updatePairWarn);
+    $("effortNote").textContent = "速度档位即 effort：越低越快、越省 token。子代理不支持 /fast，effort 是官方提速手段；照单施工推荐 medium，嫌慢可调 low。";
+  } else {
+    $("mainRow").innerHTML = `<div class="row" style="margin-top:10px"><label>主线模型：</label>
+      <code>${esc(C.main_model || "未设置")}</code>
+      <span class="muted">（系列 ${famLabel("codex", C.main_family)}；读自 ${esc(C.config_path)}，后台不改 Codex 配置）</span></div>
+      <div class="muted">本机 Codex 可选模型：${C.available.map(x => `<code>${esc(x)}</code>`).join(" ") || "<span class='warn'>读不到（codex 不在 PATH？）</span>"}</div>`;
+    $("effortNote").textContent = "档位即 model_reasoning_effort。官方建议：显式使用 Luna 时从 high 起步（Luna 单价约为 Sol 的 1/20，high 依然很便宜）。";
+  }
 
-  const effortNames = {low:"low · 最快", medium:"medium · 快（推荐）",
-    high:"high · 标准", xhigh:"xhigh · 深思", max:"max · 极限"};
-  $("effortSelect").innerHTML = '<option value="">跟随会话默认</option>' +
-    S.effort_choices.map(e => `<option value="${e}">${effortNames[e] || e}</option>`).join("");
-  $("effortSelect").value = S.executor_effort || "";
-
-  $("execInfo").innerHTML = S.executor_model
-    ? `当前 executor.md 中：<code>${S.executor_model}</code>` +
-      (S.executor_effort ? `，effort <code>${S.executor_effort}</code>` : "") +
-      `（${S.executor_path}）— 修改后新开会话生效`
-    : `<span class="warn">未找到已安装的 executor.md，请先安装墨斗（bash install.sh）。</span>`;
+  $("execSelect").innerHTML = C.executor_choices.map(f =>
+    `<option value="${f}">${famLabel(P, f)}${famPrice(P, f)}${P === "codex" && C.resolved[f] ? " → " + C.resolved[f] : ""}</option>`).join("");
+  if (C.executor_family) $("execSelect").value = C.executor_family;
+  $("effortSelect").innerHTML = (P === "claude" ? '<option value="">跟随会话默认</option>' : '<option value="">按系列推荐</option>') +
+    S.effort_choices.map(e => `<option value="${e}">${e}</option>`).join("");
+  $("effortSelect").value = C.executor_effort || "";
+  $("execInfo").innerHTML = C.executor_path
+    ? `当前：<code>${esc(C.executor_model || "继承主线")}</code>` + (C.executor_effort ? `，effort <code>${esc(C.executor_effort)}</code>` : "") +
+      `（${esc(C.executor_path)}）— 修改后新开会话生效` +
+      (P === "codex" && C.executor_latest && C.executor_latest !== C.executor_model
+        ? ` <span class="warn">本机已有该系列更新版 ${esc(C.executor_latest)}，点保存即可更新</span>` : "")
+    : `<span class="warn">未找到已安装的执行官，请先运行 <code>bash install.sh --${P}</code>。</span>`;
   updatePairWarn();
 
   $("health").innerHTML = [
-    line(S.executor_model, `执行官已安装：${S.executor_path || "—"}`, "执行官未安装（找不到 executor.md）"),
-    line(S.projects_found, `用量数据目录：${S.projects_dir}`, `找不到用量目录 ${S.projects_dir}（本机没跑过 Claude Code？）`),
-    line(true, "价格表内置于本工具，模型价格变动时请更新 PRICES。"),
+    line(C.executor_path, `执行官已安装：${esc(C.executor_path || "")}`, `执行官未安装（bash install.sh --${P}）`),
+    line(C.usage_found, `用量数据目录：${esc(C.usage_dir)}`, `找不到用量目录 ${esc(C.usage_dir)}`),
+    P === "codex" ? line(C.available.length, `Codex 模型目录可读（${C.available.length} 个可选模型）`, "读不到 Codex 模型目录") : "",
+    P === "codex" && C.unreadable_files ? line(false, "", `${C.unreadable_files} 个压缩会话文件无法解压（需 Python 3.14+ 或 zstd 命令），未计入`) : "",
+    line(true, "价格表只用于对账；选择逻辑走「系列 → 当前环境最新」。新版本 id 会按系列归一估价。"),
   ].join("");
 
   $("priceTable").innerHTML =
-    "<tr><th>模型</th><th>模型 ID</th><th>输入 $/M</th><th>输出 $/M</th></tr>" +
-    Object.entries(S.prices).map(([k, p]) =>
-      `<tr><td>${p.name}</td><td style="text-align:left"><code>${k}</code></td>` +
-      `<td>$${p.in}</td><td>$${p.out}</td></tr>`).join("");
+    "<tr><th>模型</th><th>模型 ID</th><th>输入 $/M</th><th>缓存读 $/M</th><th>输出 $/M</th></tr>" +
+    Object.entries(S.prices).filter(([k, p]) => p.platform === P).map(([k, p]) =>
+      `<tr><td>${esc(p.name)}</td><td style="text-align:left"><code>${esc(k)}</code></td>` +
+      `<td>$${p.in}</td><td>${p.cr != null ? "$" + p.cr : "—"}</td><td>$${p.out}</td></tr>`).join("");
 }
 
 function line(ok, okText, badText) {
@@ -817,40 +1091,39 @@ function line(ok, okText, badText) {
 }
 
 function updatePairWarn() {
-  const main = $("autoMain").checked ? S.main_auto_pick : $("mainSelect").value;
+  const C = S[P];
+  let mainFam = C.main_family;
+  if (P === "claude" && $("autoMain")) mainFam = $("autoMain").checked ? C.main_auto : $("mainSelect").value;
   const ex = $("execSelect").value;
-  const pm = S.prices[main], pe = S.prices[ex];
-  $("pairWarn").innerHTML = (pm && pe && pe.in >= pm.in)
-    ? `<span class="warn">⚠ 执行官（$${pe.in}/M）不便宜于主模型（$${pm.in}/M）——同级转包纯增开销，墨斗的前提是主强于执行官。</span>`
-    : `执行官为主模型价格的 ${pm && pe ? Math.round(pe.in/pm.in*100) : "?"}%，委派实施可显著省钱。`;
+  const pm = C.family_prices[mainFam], pe = C.family_prices[ex];
+  if (!pm || !pe) { $("pairWarn").textContent = "主线系列未知，无法做配对检查。"; return; }
+  $("pairWarn").innerHTML = (pe.out >= pm.out)
+    ? `<span class="warn">⚠ 同级转包纯增开销：执行官 ${pe.label}（$${pe.out}/M 输出）不便宜于主线 ${pm.label}（$${pm.out}/M）——默认不要这样配对。</span>`
+    : `执行官单价约为主线的 ${Math.round(pe.out / pm.out * 100)}%（按两系列最新已知价：${pe.ref} vs ${pm.ref}），委派实施可显著省钱。`;
+}
+
+async function post(url, body) {
+  const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  return r.json();
 }
 
 async function saveMain() {
   const auto = $("autoMain").checked;
-  const r = await fetch("/api/settings/main", {method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify(auto ? {auto:true} : {model: $("mainSelect").value})});
-  const d = await r.json();
-  if (d.ok) { toast(`主模型已设为 ${d.model}`); loadSettings(); }
+  const d = await post("/api/settings/claude/main", auto ? {auto: true} : {family: $("mainSelect").value});
+  if (d.ok) { toast(`主线已设为 ${d.family}（新开会话生效）`); loadSettings(); }
   else toast(d.error || "失败", true);
 }
 
 async function saveExec() {
-  const r = await fetch("/api/settings/executor", {method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({model: $("execSelect").value, effort: $("effortSelect").value})});
-  const d = await r.json();
-  if (d.ok) { toast(`执行官已设为 ${d.model}${d.effort ? " / " + d.effort : ""}，新开会话生效`); loadSettings(); loadUsage(currentRange); }
+  const d = await post(`/api/settings/${P}/executor`, {family: $("execSelect").value, effort: $("effortSelect").value});
+  if (d.ok) { toast(`执行官已设为 ${d.model || d.family}，新开会话生效`); loadSettings(); loadUsage(currentRange); }
   else toast(d.error || "失败", true);
 }
 
-$("autoMain").addEventListener("change", e => {
-  $("mainSelect").disabled = e.target.checked; updatePairWarn();
-});
-$("mainSelect").addEventListener("change", updatePairWarn);
 $("execSelect").addEventListener("change", updatePairWarn);
-$("tabs").addEventListener("click", e => {
-  if (e.target.dataset.r) loadUsage(e.target.dataset.r);
+$("tabs").addEventListener("click", e => { if (e.target.dataset.r) loadUsage(e.target.dataset.r); });
+$("plats").addEventListener("click", e => {
+  if (e.target.dataset.p) { P = e.target.dataset.p; loadSettings().then(() => loadUsage(currentRange)); }
 });
 
 loadSettings().then(() => loadUsage("yesterday"));
@@ -860,22 +1133,43 @@ loadSettings().then(() => loadUsage("yesterday"));
 """
 
 
+def build_context(claude_dir, codex_dir, project=None):
+    cache = {"t": None, "v": []}
+
+    def codex_models():
+        # codex debug models 要起子进程，缓存 5 分钟
+        now = datetime.now()
+        if cache["t"] is None or (now - cache["t"]).total_seconds() > 300:
+            cache["v"] = mm.codex_available_models()
+            cache["t"] = now
+        return cache["v"]
+
+    return {
+        "scanners": {"claude": ClaudeScanner(claude_dir), "codex": CodexScanner(codex_dir)},
+        "claude_cfg": ClaudeConfig(claude_dir, project),
+        "codex_cfg": CodexConfig(codex_dir, project),
+        "codex_models": codex_models,
+    }
+
+
 def main():
-    ap = argparse.ArgumentParser(description="墨斗管理后台")
+    ap = argparse.ArgumentParser(description="墨斗管理后台（Claude Code + Codex）")
     ap.add_argument("--port", type=int, default=8848)
-    ap.add_argument("--claude-dir", default=os.path.expanduser("~/.claude"),
-                    help="Claude Code 配置目录（默认 ~/.claude）")
+    ap.add_argument("--claude-dir", default=str(mm.claude_home()),
+                    help="Claude Code 配置目录（默认 $CLAUDE_CONFIG_DIR 或 ~/.claude）")
+    ap.add_argument("--codex-dir", default=str(mm.codex_home()),
+                    help="Codex 配置目录（默认 $CODEX_HOME 或 ~/.codex）")
+    ap.add_argument("--project", default=None,
+                    help="同时查看/修改该项目的项目级安装（.claude/agents、.codex/agents）")
     ap.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     args = ap.parse_args()
 
-    repo_dir = Path(__file__).resolve().parent.parent
-    scanner = UsageScanner(args.claude_dir)
-    config = Config(args.claude_dir, repo_dir)
-
+    ctx = build_context(args.claude_dir, args.codex_dir,
+                        str(Path(args.project).resolve()) if args.project else None)
     addr = ("127.0.0.1", args.port)
-    httpd = ThreadingHTTPServer(addr, make_handler(scanner, config))
-    url = f"http://{addr[0]}:{args.port}"
-    print(f"墨斗管理后台已启动：{url}  (Ctrl+C 退出)")
+    httpd = ThreadingHTTPServer(addr, make_handler(ctx))
+    url = "http://%s:%d" % addr
+    print("墨斗管理后台已启动：%s  (Ctrl+C 退出)" % url, flush=True)
     if not args.no_browser:
         try:
             webbrowser.open(url)
