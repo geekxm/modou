@@ -1,3 +1,7 @@
 .DS_Store
 __MACOSX/
 *.bak.*
+__pycache__/
+*.pyc
+.codex/agents/modou.toml
+.claude/agents/executor.md
