@@ -9,6 +9,7 @@
    - 只装 Codex：加 `--codex`；只装 Claude Code：加 `--claude`；都不加 = 检测到哪个装哪个。
    - 用户级（所有项目生效）：`bash <本仓库路径>/install.sh --user`
    - 脚本会先备份被覆盖的文件（默认 `~/.local/state/modou/backups/<时间戳>/`），可重复运行。
+   - Codex 的 `workspace-write` 沙箱不允许写项目里的 `.codex/`：请向用户申请提权（escalated）运行这条命令；若无法提权，请用户在终端里自己运行它。
 2. 自检：`bash <本仓库路径>/install.sh --check --project <目标项目路径>`，全部 ✓ 才算就位。
 3. 告诉用户：新开 Codex / Claude Code 会话后生效（agent 列表在会话启动时加载）。
 4. 不要手改生成的 `model = ...` 行去钉死版本；换代后重跑 install.sh，它会按系列重新解析本机最新模型。

@@ -51,6 +51,10 @@ class Writer:
             return None
         rel = str(path.resolve()).lstrip("/")
         dest = self.backup_root / rel
+        n = 1
+        while dest.exists():  # 同一秒内多次写同一文件：绝不覆盖已有备份
+            dest = self.backup_root / ("%s.%d" % (rel, n))
+            n += 1
         if not self.dry_run:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, dest)
@@ -256,8 +260,14 @@ def check(scope, project, platforms):
             try:
                 import tomllib
                 d = tomllib.loads(text)
-            except ImportError:
-                d = {"name": "modou", "model": (re.search(r'^model\s*=\s*"([^"]+)"', text, re.M) or [None, None])[1]}
+            except ImportError:  # Python < 3.11：只做够用的字段提取
+                d = {}
+                for k in ("name", "description", "model", "model_reasoning_effort"):
+                    m = re.search(r'^%s\s*=\s*"((?:[^"\\]|\\.)*)"' % k, text, re.M)
+                    if m:
+                        d[k] = m.group(1)
+                if re.search(r"^developer_instructions\s*=\s*('''|\"\"\")\n?\S", text, re.M):
+                    d["developer_instructions"] = True
             except Exception as e:  # tomllib.TOMLDecodeError
                 say("✗ [codex] %s TOML 解析失败：%s" % (a, e))
                 ok = False
@@ -361,6 +371,13 @@ def main(argv=None):
             except ValueError as e:
                 say("✗ %s" % e)
                 return 2
+            except PermissionError as e:
+                say("✗ 没有写权限：%s" % (e.filename or e))
+                if os.environ.get("CODEX_SANDBOX") or ".codex" in str(e.filename or ""):
+                    say("  Codex 的 workspace-write 沙箱禁止写项目里的 .codex/ 目录。请批准该命令以提权运行，"
+                        "或在普通终端里直接执行：bash %s/install.sh %s"
+                        % (REPO, " ".join(sys.argv[1:]) if sys.argv[1:] else ""))
+                return 3
     baks = [b for _, _, b in w.log if b]
     if baks:
         say("已备份 %d 个原有文件到：%s" % (len(baks), w.backup_root))

@@ -364,7 +364,10 @@ def _zstd_lines(path):
     exe = shutil.which("zstd")
     if not exe:
         raise OSError("no zstd decoder")
-    out = subprocess.run([exe, "-dc", str(path)], capture_output=True, timeout=60)
+    try:
+        out = subprocess.run([exe, "-dc", str(path)], capture_output=True, timeout=60)
+    except subprocess.SubprocessError as e:
+        raise OSError(str(e))
     if out.returncode != 0:
         raise OSError("zstd failed")
     for line in out.stdout.decode("utf-8", "replace").splitlines():

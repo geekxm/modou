@@ -117,7 +117,10 @@ class ProtocolSync(unittest.TestCase):
         self.assertNotRegex(fm, r"claude-[a-z]+-\d")
 
     def test_codex_template(self):
-        import tomllib
+        try:
+            import tomllib
+        except ImportError:
+            self.skipTest("tomllib 需要 Python 3.11+")
         d = tomllib.loads((REPO / "agents" / "codex" / "modou.toml").read_text(encoding="utf-8"))
         self.assertEqual(d["developer_instructions"], self.protocol)
         self.assertEqual(d["name"], "modou")
@@ -227,6 +230,15 @@ class Installer(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertFalse((self.proj / ".codex" / "agents" / "modou.toml").exists())
         self.assertEqual((self.proj / "AGENTS.md").read_text(), "# mine\n")
+
+    def test_backups_never_overwrite_each_other(self):
+        f = self.proj / "x.txt"
+        f.write_text("v1")
+        w = mi.Writer()
+        w.write(f, "v2")
+        w.write(f, "v3")  # 同一个 Writer = 同一个时间戳目录
+        baks = sorted(p.read_text() for p in Path(self.env["MODOU_BACKUP_DIR"]).rglob("x.txt*"))
+        self.assertEqual(baks, ["v1", "v2"])
 
     def test_dry_run_writes_nothing(self):
         rc, out = self.run_install("--dry-run", "--claude", "--codex", "--project", str(self.proj))
